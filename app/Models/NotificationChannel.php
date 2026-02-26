@@ -22,11 +22,24 @@ class NotificationChannel extends Model
     ];
 
     /**
-     * Encrypt the config JSON on set.
+     * Always store config as encrypted JSON.
+     * Accepts either an array (from the Filament form) or a plain string.
      */
-    public function setConfigAttribute(array $value): void
+    public function setConfigAttribute(mixed $value): void
     {
-        $this->attributes['config'] = Crypt::encryptString(json_encode($value));
+        if (is_array($value)) {
+            $this->attributes['config'] = Crypt::encryptString(json_encode($value));
+        } elseif (is_string($value)) {
+            // Check if it's already an encrypted payload (starts with eyJ = base64 JSON)
+            try {
+                Crypt::decryptString($value);
+                // Already encrypted — store as-is
+                $this->attributes['config'] = $value;
+            } catch (\Illuminate\Contracts\Encryption\DecryptException) {
+                // Plain JSON string — encrypt it
+                $this->attributes['config'] = Crypt::encryptString($value);
+            }
+        }
     }
 
     /**

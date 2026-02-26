@@ -7,7 +7,6 @@ use App\Models\NotificationChannel;
 use App\Notifications\BackupStatusNotification;
 use Cron\CronExpression;
 use Illuminate\Console\Command;
-use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
@@ -15,17 +14,22 @@ use Throwable;
 
 class RunScheduledBackups extends Command
 {
-    protected $signature   = 'backup:run-scheduled';
-    protected $description = 'Run all due backup configurations';
+    protected $signature   = 'backup:run-scheduled {--id= : Run a specific backup configuration by ID}';
+    protected $description = 'Run all due backup configurations (or a specific one by --id)';
 
     public function handle(): int
     {
-        $configs = BackupConfiguration::with(['databaseCredential', 'notificationChannels'])
-            ->where('enabled', true)
-            ->get();
+        $query = BackupConfiguration::with(['databaseCredential', 'notificationChannels'])
+            ->where('enabled', true);
+
+        if ($id = $this->option('id')) {
+            $query->where('id', $id);
+        }
+
+        $configs = $query->get();
 
         foreach ($configs as $config) {
-            if ($this->isDue($config)) {
+            if ($this->option('id') || $this->isDue($config)) {
                 $this->runBackup($config);
             }
         }
@@ -60,25 +64,17 @@ class RunScheduledBackups extends Command
             Config::set("database.connections.{$connectionName}", $credential->toConnectionConfig());
             DB::purge($connectionName);
 
-            // Create backup filename
-            $filename = sprintf(
-                '%s_%s.sql',
-                preg_replace('/[^a-z0-9_-]/i', '_', $credential->database),
-                now()->format('Y-m-d_H-i-s')
-            );
-            $path = 'backups/'.$filename;
+            $safeName    = preg_replace('/[^a-z0-9_-]/i', '_', $credential->database);
+            $filename    = "{$safeName}_".now()->format('Y-m-d_H-i-s').'.sql';
+            $storagePath = 'backups/'.$filename;
 
-            // Dump database
-            $this->dumpDatabase($connectionName, $credential, $path);
+            // Dump database to tmp file, then persist to storage disk
+            $this->dumpDatabase($credential, $storagePath);
 
-            // Mark success
             $config->update(['last_run_at' => now(), 'last_status' => 'success']);
-
-            // Prune old backups
-            $this->pruneOldBackups($credential->database, $config->retention_days);
+            $this->pruneOldBackups($safeName, $config->retention_days);
 
             $this->info("Backup successful: {$filename}");
-
             $this->notify($config, 'success', "File: {$filename}");
         } catch (Throwable $e) {
             $config->update(['last_run_at' => now(), 'last_status' => 'failed']);
@@ -90,34 +86,37 @@ class RunScheduledBackups extends Command
         }
     }
 
-    private function dumpDatabase(string $connection, mixed $credential, string $storagePath): void
+    private function dumpDatabase(mixed $credential, string $storagePath): void
     {
-        $driverMap = [
-            'mysql'  => 'mysqldump',
-            'pgsql'  => 'pg_dump',
-            'sqlite' => 'sqlite3',
-        ];
-
         $driver = $credential->driver;
 
-        if (! isset($driverMap[$driver])) {
+        if (! in_array($driver, ['mysql', 'pgsql', 'sqlite'], true)) {
             throw new \RuntimeException("Unsupported driver: {$driver}");
         }
 
-        $tmpFile = tempnam(sys_get_temp_dir(), 'bkp_').'.'.$driver.'.sql';
+        // Secure unique temp file
+        $tmpFile = tempnam(sys_get_temp_dir(), 'bkp_backup_').'.sql';
 
         try {
             if ($driver === 'mysql') {
+                // Write credentials to a temp options file so they never appear
+                // in process listings (avoids --password= on the CLI)
+                $optionsFile = tempnam(sys_get_temp_dir(), 'mysql_opts_');
+                file_put_contents($optionsFile,
+                    "[client]\npassword=".str_replace('"', '\\"', $credential->password)."\n");
+                chmod($optionsFile, 0600);
+
                 $cmd = sprintf(
-                    'mysqldump --host=%s --port=%d --user=%s --password=%s --single-transaction --routines --triggers %s > %s 2>&1',
+                    'mysqldump --defaults-extra-file=%s --host=%s --port=%d --user=%s --single-transaction --routines --triggers %s > %s 2>&1',
+                    escapeshellarg($optionsFile),
                     escapeshellarg($credential->host),
                     (int) $credential->port,
                     escapeshellarg($credential->username),
-                    escapeshellarg($credential->password),
                     escapeshellarg($credential->database),
                     escapeshellarg($tmpFile)
                 );
             } elseif ($driver === 'pgsql') {
+                // PGPASSWORD is the recommended secure approach for pg_dump
                 $cmd = sprintf(
                     'PGPASSWORD=%s pg_dump --host=%s --port=%d --username=%s %s > %s 2>&1',
                     escapeshellarg($credential->password),
@@ -128,7 +127,6 @@ class RunScheduledBackups extends Command
                     escapeshellarg($tmpFile)
                 );
             } else {
-                // SQLite
                 $cmd = sprintf(
                     'sqlite3 %s .dump > %s 2>&1',
                     escapeshellarg($credential->database),
@@ -138,31 +136,33 @@ class RunScheduledBackups extends Command
 
             exec($cmd, $output, $returnCode);
 
+            if (isset($optionsFile)) {
+                @unlink($optionsFile);
+            }
+
             if ($returnCode !== 0) {
                 throw new \RuntimeException("Dump command failed (exit {$returnCode})");
             }
 
-            // Store in configured disk
-            Storage::disk(config('backup.destination.disks.0', 'local'))
-                ->put($storagePath, file_get_contents($tmpFile));
+            $disk = config('backup.monitor_backups.0.destination.disks.0', 'local');
+            Storage::disk($disk)->put($storagePath, file_get_contents($tmpFile));
         } finally {
             @unlink($tmpFile);
         }
     }
 
-    private function pruneOldBackups(string $database, int $retentionDays): void
+    private function pruneOldBackups(string $safeDatabaseName, int $retentionDays): void
     {
         if ($retentionDays <= 0) {
             return;
         }
 
-        $disk    = Storage::disk(config('backup.destination.disks.0', 'local'));
-        $prefix  = 'backups/'.preg_replace('/[^a-z0-9_-]/i', '_', $database).'_';
-        $cutoff  = now()->subDays($retentionDays)->timestamp;
+        $disk   = Storage::disk(config('backup.monitor_backups.0.destination.disks.0', 'local'));
+        $prefix = 'backups/'.$safeDatabaseName.'_';
+        $cutoff = now()->subDays($retentionDays)->timestamp;
 
         foreach ($disk->files('backups') as $file) {
-            if (str_starts_with(basename($file), basename($prefix))
-                && $disk->lastModified($file) < $cutoff) {
+            if (str_starts_with($file, $prefix) && $disk->lastModified($file) < $cutoff) {
                 $disk->delete($file);
             }
         }
@@ -175,7 +175,7 @@ class RunScheduledBackups extends Command
                 continue;
             }
 
-            // Create a notifiable object carrying the channel config
+            // Anonymous notifiable carrying channel-specific config
             $notifiable = new class($channel) {
                 public string $type;
                 public array  $channel_config;
@@ -189,6 +189,14 @@ class RunScheduledBackups extends Command
                 public function routeNotificationFor(string $driver): mixed
                 {
                     return $this->channel_config;
+                }
+
+                public function notify(mixed $notification): void
+                {
+                    $channels = $notification->via($this);
+                    foreach ($channels as $channelClass) {
+                        app($channelClass)->send($this, $notification);
+                    }
                 }
             };
 

@@ -59,7 +59,6 @@ class DatabaseCredentialResource extends Resource
                         ->password()
                         ->revealable()
                         ->required()
-                        ->dehydrateStateUsing(fn ($state) => $state)
                         ->placeholder('••••••••'),
                 ])
                 ->columns(2),

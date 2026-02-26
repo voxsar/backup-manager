@@ -103,7 +103,7 @@ class BackupConfigurationResource extends Resource
                     ->label('Run Now')
                     ->icon('heroicon-o-play')
                     ->action(function (BackupConfiguration $record): void {
-                        \Artisan::call('backup:run-scheduled');
+                        \Artisan::call('backup:run-scheduled', ['--id' => $record->id]);
                     })
                     ->requiresConfirmation()
                     ->color('success'),
