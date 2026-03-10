@@ -1,0 +1,39 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: backup-manager
+    restart: unless-stopped
+    ports:
+      - "5828:8080"
+    volumes:
+      - backup_storage:/var/www/html/storage/app
+      - backup_db:/var/www/html/database
+    environment:
+      APP_NAME: "Backup Manager"
+      APP_ENV: production
+      APP_DEBUG: "false"
+      APP_URL: http://localhost:5828
+      APP_TIMEZONE: UTC
+      DB_CONNECTION: sqlite
+      DB_DATABASE: /var/www/html/database/database.sqlite
+      SESSION_DRIVER: database
+      CACHE_STORE: database
+      QUEUE_CONNECTION: database
+      FILESYSTEM_DISK: local
+      BACKUP_DISK: local
+      LOG_CHANNEL: stack
+      LOG_LEVEL: info
+      # Override any of the above with a .env file at runtime:
+      # APP_KEY, WHATSAPP_API_URL, MATTERMOST_WEBHOOK_URL, etc.
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/up"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  backup_storage:
+  backup_db:
