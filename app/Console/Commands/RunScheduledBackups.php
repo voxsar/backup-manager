@@ -10,12 +10,18 @@ use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\Log;
+use Spatie\DbDumper\Databases\MySql;
+use Spatie\DbDumper\Databases\PostgreSql;
+use Spatie\DbDumper\Databases\Sqlite;
+use Spatie\DbDumper\Compressors\GzipCompressor;
+use ZipArchive;
 use Throwable;
 
 class RunScheduledBackups extends Command
 {
     protected $signature   = 'backup:run-scheduled {--id= : Run a specific backup configuration by ID}';
-    protected $description = 'Run all due backup configurations (or a specific one by --id)';
+    protected $description = 'Run all due backup configurations using Spatie DbDumper (or a specific one by --id)';
 
     public function handle(): int
     {
@@ -58,117 +64,180 @@ class RunScheduledBackups extends Command
         }
 
         $connectionName = "backup_dynamic_{$config->id}";
+        $safeName = preg_replace('/[^a-z0-9_-]/i', '_', $credential->database);
+
+        $startTime = microtime(true);
+        $backupSize = null;
+        $backupSizeBytes = 0;
+        $storagePath = null;
 
         try {
             // Register dynamic database connection
             Config::set("database.connections.{$connectionName}", $credential->toConnectionConfig());
             DB::purge($connectionName);
 
-            $safeName    = preg_replace('/[^a-z0-9_-]/i', '_', $credential->database);
-            $filename    = "{$safeName}_".now()->format('Y-m-d_H-i-s').'.sql';
-            $storagePath = 'backups/'.$filename;
+            $backupName = "{$safeName}_" . now()->format('Y-m-d_H-i-s');
+            
+            // Create database dump using Spatie's DbDumper
+            $dumpFilePath = $this->createDatabaseDump($credential,  $backupName);
 
-            // Dump database to tmp file, then persist to storage disk
-            $this->dumpDatabase($credential, $storagePath);
+            // Create ZIP archive (like Spatie Backup does)
+            $zipFilePath = $this->createZipArchive($dumpFilePath, $backupName);
 
+            // Get backup size
+            $backupSizeBytes = filesize($zipFilePath);
+            $backupSize = $this->formatBytes($backupSizeBytes);
+
+            // Upload to storage
+            $storagePath = "backups/{$safeName}/{$backupName}.zip";
+            $disk = config('backup.monitor_backups.0.destination.disks.0', 'wasabi');
+            Storage::disk($disk)->put($storagePath, file_get_contents($zipFilePath));
+
+            // Cleanup temp files
+            @unlink($dumpFilePath);
+            @unlink($zipFilePath);
+
+            $duration = microtime(true) - $startTime;
+
+            // Update statistics
+            $config->increment('total_backups');
+            $config->increment('total_size_bytes', $backupSizeBytes);
             $config->update(['last_run_at' => now(), 'last_status' => 'success']);
-            $this->pruneOldBackups($safeName, $config->retention_days);
+            
+            // Reload to get updated stats
+            $config->refresh();
 
-            $this->info("Backup successful: {$filename}");
-            $this->notify($config, 'success', "File: {$filename}");
+            $this->info("Backup successful: {$backupName}.zip");
+            $this->notify(
+                $config, 
+                'success', 
+                "Backup completed successfully",
+                $credential->database,
+                $backupSize,
+                $duration,
+                $storagePath,
+                $config->total_backups,
+                $this->formatBytes($config->total_size_bytes)
+            );
         } catch (Throwable $e) {
+            $duration = microtime(true) - $startTime;
             $config->update(['last_run_at' => now(), 'last_status' => 'failed']);
             $this->error("Backup failed for config #{$config->id}: {$e->getMessage()}");
-            $this->notify($config, 'failed', $e->getMessage());
+            $this->notify(
+                $config, 
+                'failed', 
+                $e->getMessage(),
+                $credential->database,
+                null,
+                $duration,
+                null,
+                $config->total_backups,
+                $this->formatBytes($config->total_size_bytes)
+            );
+            Log::error("Backup failed for config #{$config->id}", ['exception' => $e]);
         } finally {
             Config::set("database.connections.{$connectionName}", null);
             DB::purge($connectionName);
         }
     }
 
-    private function dumpDatabase(mixed $credential, string $storagePath): void
+    private function formatBytes(int $bytes): string
     {
-        $driver = $credential->driver;
-
-        if (! in_array($driver, ['mysql', 'pgsql', 'sqlite'], true)) {
-            throw new \RuntimeException("Unsupported driver: {$driver}");
-        }
-
-        // Secure unique temp file
-        $tmpFile = tempnam(sys_get_temp_dir(), 'bkp_backup_').'.sql';
-
-        try {
-            if ($driver === 'mysql') {
-                // Write credentials to a temp options file so they never appear
-                // in process listings (avoids --password= on the CLI)
-                $optionsFile = tempnam(sys_get_temp_dir(), 'mysql_opts_');
-                file_put_contents($optionsFile,
-                    "[client]\npassword=".str_replace('"', '\\"', $credential->password)."\n");
-                chmod($optionsFile, 0600);
-
-                $cmd = sprintf(
-                    'mysqldump --defaults-extra-file=%s --host=%s --port=%d --user=%s --single-transaction --routines --triggers %s > %s 2>&1',
-                    escapeshellarg($optionsFile),
-                    escapeshellarg($credential->host),
-                    (int) $credential->port,
-                    escapeshellarg($credential->username),
-                    escapeshellarg($credential->database),
-                    escapeshellarg($tmpFile)
-                );
-            } elseif ($driver === 'pgsql') {
-                // PGPASSWORD is the recommended secure approach for pg_dump
-                $cmd = sprintf(
-                    'PGPASSWORD=%s pg_dump --host=%s --port=%d --username=%s %s > %s 2>&1',
-                    escapeshellarg($credential->password),
-                    escapeshellarg($credential->host),
-                    (int) $credential->port,
-                    escapeshellarg($credential->username),
-                    escapeshellarg($credential->database),
-                    escapeshellarg($tmpFile)
-                );
-            } else {
-                $cmd = sprintf(
-                    'sqlite3 %s .dump > %s 2>&1',
-                    escapeshellarg($credential->database),
-                    escapeshellarg($tmpFile)
-                );
-            }
-
-            exec($cmd, $output, $returnCode);
-
-            if (isset($optionsFile)) {
-                @unlink($optionsFile);
-            }
-
-            if ($returnCode !== 0) {
-                throw new \RuntimeException("Dump command failed (exit {$returnCode})");
-            }
-
-            $disk = config('backup.monitor_backups.0.destination.disks.0', 'local');
-            Storage::disk($disk)->put($storagePath, file_get_contents($tmpFile));
-        } finally {
-            @unlink($tmpFile);
-        }
+        $units = ['B', 'KB', 'MB', 'GB'];
+        $bytes = max($bytes, 0);
+        $pow = floor(($bytes ? log($bytes) : 0) / log(1024));
+        $pow = min($pow, count($units) - 1);
+        $bytes /= (1 << (10 * $pow));
+        return round($bytes, 2) . ' ' . $units[$pow];
     }
 
-    private function pruneOldBackups(string $safeDatabaseName, int $retentionDays): void
+    private function createDatabaseDump($credential, string $backupName): string
     {
-        if ($retentionDays <= 0) {
-            return;
+        $dumpFile = sys_get_temp_dir() . '/' . $backupName . '.sql';
+
+        // Use Spatie's DbDumper classes
+        if ($credential->driver === 'mysql') {
+            MySql::create()
+                ->setDbName($credential->database)
+                ->setUserName($credential->username)
+                ->setPassword($credential->password)
+                ->setHost($credential->host)
+                ->setPort($credential->port)
+                ->addExtraOption('--single-transaction')
+                ->addExtraOption('--routines')
+                ->addExtraOption('--triggers')
+                ->dumpToFile($dumpFile);
+        } elseif ($credential->driver === 'pgsql') {
+            PostgreSql::create()
+                ->setDbName($credential->database)
+                ->setUserName($credential->username)
+                ->setPassword($credential->password)
+                ->setHost($credential->host)
+                ->setPort($credential->port)
+                ->dumpToFile($dumpFile);
+        } elseif ($credential->driver === 'sqlite') {
+            Sqlite::create()
+                ->setDbName($credential->database)
+                ->dumpToFile($dumpFile);
+        } else {
+            throw new \RuntimeException("Unsupported database driver: {$credential->driver}");
         }
 
-        $disk   = Storage::disk(config('backup.monitor_backups.0.destination.disks.0', 'local'));
-        $prefix = 'backups/'.$safeDatabaseName.'_';
-        $cutoff = now()->subDays($retentionDays)->timestamp;
-
-        foreach ($disk->files('backups') as $file) {
-            if (str_starts_with($file, $prefix) && $disk->lastModified($file) < $cutoff) {
-                $disk->delete($file);
-            }
+        // Verify dump file was created
+        if (!file_exists($dumpFile)) {
+            throw new \RuntimeException("Database dump file was not created: {$dumpFile}");
         }
+
+        // Compress with gzip
+        $compressedFile = $dumpFile . '.gz';
+        exec("gzip -c " . escapeshellarg($dumpFile) . " > " . escapeshellarg($compressedFile), $output, $returnCode);
+        
+        if ($returnCode !== 0 || !file_exists($compressedFile)) {
+            throw new \RuntimeException("Failed to compress dump file");
+        }
+
+        // Remove uncompressed file
+        @unlink($dumpFile);
+
+        return $compressedFile;
     }
 
-    private function notify(BackupConfiguration $config, string $status, string $message): void
+    private function createZipArchive(string $dumpFile, string $backupName): string
+    {
+        $zipFile = sys_get_temp_dir() . '/' . $backupName . '.zip';
+
+        $zip = new ZipArchive();
+        if ($zip->open($zipFile, ZipArchive::CREATE) !== true) {
+            throw new \RuntimeException("Could not create ZIP archive");
+        }
+
+        // Add the compressed SQL dump to the ZIP
+        $zip->addFile($dumpFile, 'db-dumps/' . basename($dumpFile));
+        
+        // Add manifest file (like Spatie does)
+        $manifest = [
+            'backup_name' => $backupName,
+            'created_at' => now()->toIso8601String(),
+            'database' => basename($dumpFile),
+        ];
+        $zip->addFromString('manifest.json', json_encode($manifest, JSON_PRETTY_PRINT));
+        
+        $zip->close();
+
+        return $zipFile;
+    }
+
+    private function notify(
+        BackupConfiguration $config, 
+        string $status, 
+        string $message,
+        ?string $databaseName = null,
+        ?string $backupSize = null,
+        ?float $duration = null,
+        ?string $backupPath = null,
+        ?int $totalBackups = null,
+        ?string $totalSize = null
+    ): void
     {
         foreach ($config->notificationChannels as $channel) {
             if (! $channel->enabled) {
@@ -202,7 +271,17 @@ class RunScheduledBackups extends Command
 
             try {
                 $notifiable->notify(
-                    new BackupStatusNotification($config->name, $status, $message)
+                    new BackupStatusNotification(
+                        $config->name, 
+                        $status, 
+                        $message,
+                        $databaseName,
+                        $backupSize,
+                        $duration,
+                        $backupPath,
+                        $totalBackups,
+                        $totalSize
+                    )
                 );
             } catch (Throwable $e) {
                 $this->warn("Notification failed: {$e->getMessage()}");

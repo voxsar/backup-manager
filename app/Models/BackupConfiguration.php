@@ -17,12 +17,16 @@ class BackupConfiguration extends Model
         'enabled',
         'last_run_at',
         'last_status',
+        'total_backups',
+        'total_size_bytes',
     ];
 
     protected $casts = [
-        'enabled'      => 'boolean',
+        'enabled'        => 'boolean',
         'retention_days' => 'integer',
-        'last_run_at'  => 'datetime',
+        'last_run_at'    => 'datetime',
+        'total_backups'  => 'integer',
+        'total_size_bytes' => 'integer',
     ];
 
     public function databaseCredential()

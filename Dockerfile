@@ -14,6 +14,7 @@ RUN apk add --no-cache \
     npm \
     oniguruma-dev \
     postgresql-client \
+    postgresql-dev \
     sqlite \
     supervisor \
     unzip \

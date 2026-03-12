@@ -19,10 +19,10 @@ return [
                 'ignore_unreadable_dirs'   => false,
                 'relative_path'            => null,
             ],
-            'databases' => ['sqlite'],
+            'databases' => [],
         ],
-        'database_dump_compressor' => null,
-        'database_dump_file_extension' => '',
+        'database_dump_compressor' => \Spatie\DbDumper\Compressors\GzipCompressor::class,
+        'database_dump_file_extension' => '.gz',
     ],
 
     'notifications' => [
@@ -43,7 +43,7 @@ return [
             ],
         ],
         'slack' => [
-            'webhook_url' => '',
+            'webhook_url' => 'https://collab.artslabcreatives.com/hooks/9kfuormjojr3tyr9zhkt31ftae',
             'channel'     => null,
             'username'    => null,
             'icon'        => null,
@@ -58,14 +58,14 @@ return [
     'monitor_backups' => [
         [
             'name'                 => env('APP_NAME', 'laravel-backup'),
-            'disks'                => ['local'],
+            'disks'                => [env('BACKUP_DISK', 'wasabi')],
             'health_checks'        => [
-                \Spatie\Backup\Tasks\Monitor\HealthChecks\MaximumAgeInDays::class  => 1,
-                \Spatie\Backup\Tasks\Monitor\HealthChecks\MaximumStorageInMegabytes::class => 5000,
+                \Spatie\Backup\Tasks\Monitor\HealthChecks\MaximumAgeInDays::class  => 365,
+                \Spatie\Backup\Tasks\Monitor\HealthChecks\MaximumStorageInMegabytes::class => 5000000,
             ],
             'destination' => [
                 'disks' => [
-                    env('BACKUP_DISK', 'local'),
+                    env('BACKUP_DISK', 'wasabi'),
                 ],
             ],
         ],
@@ -74,12 +74,13 @@ return [
     'cleanup' => [
         'strategy' => \Spatie\Backup\Tasks\Cleanup\Strategies\DefaultStrategy::class,
         'default_strategy' => [
-            'keep_all_backups_for_days'               => 7,
-            'keep_daily_backups_for_days'              => 16,
-            'keep_weekly_backups_for_weeks'            => 8,
-            'keep_monthly_backups_for_months'          => 4,
-            'keep_yearly_backups_for_years'            => 2,
-            'delete_oldest_backups_when_using_more_megabytes_than' => 5000,
+            // Set extremely high values to effectively disable cleanup
+            'keep_all_backups_for_days'               => 36500, // ~100 years
+            'keep_daily_backups_for_days'              => 36500,
+            'keep_weekly_backups_for_weeks'            => 5200,
+            'keep_monthly_backups_for_months'          => 1200,
+            'keep_yearly_backups_for_years'            => 100,
+            'delete_oldest_backups_when_using_more_megabytes_than' => 999999999, // ~1 PB
         ],
     ],
 ];

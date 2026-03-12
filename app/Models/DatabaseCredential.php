@@ -47,19 +47,31 @@ class DatabaseCredential extends Model
      */
     public function toConnectionConfig(): array
     {
-        return [
+        $config = [
             'driver'   => $this->driver,
             'host'     => $this->host,
             'port'     => $this->port,
             'database' => $this->database,
             'username' => $this->username,
             'password' => $this->password,
-            'charset'  => 'utf8mb4',
-            'collation'=> 'utf8mb4_unicode_ci',
             'prefix'   => '',
             'strict'   => true,
-            'engine'   => null,
         ];
+
+        // Driver-specific configurations
+        if ($this->driver === 'mysql') {
+            $config['charset'] = 'utf8mb4';
+            $config['collation'] = 'utf8mb4_unicode_ci';
+            $config['engine'] = null;
+        } elseif ($this->driver === 'pgsql') {
+            $config['charset'] = 'utf8';
+            $config['schema'] = 'public';
+            $config['sslmode'] = 'prefer';
+        } elseif ($this->driver === 'sqlite') {
+            $config['foreign_key_constraints'] = true;
+        }
+
+        return $config;
     }
 
     public function backupConfigurations()

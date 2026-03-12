@@ -7,6 +7,7 @@ use Illuminate\Notifications\Notification;
 
 /**
  * Mattermost notification channel via Incoming Webhooks.
+ * Supports Slack-compatible message attachments for rich formatting.
  *
  * Config keys: webhook_url, username (optional), channel (optional)
  */
@@ -27,7 +28,8 @@ class MattermostChannel
             return;
         }
 
-        $payload = ['text' => $message];
+        // Support both string (simple) and array (rich Slack-compatible) formats
+        $payload = is_array($message) ? $message : ['text' => $message];
 
         if (! empty($config['username'])) {
             $payload['username'] = $config['username'];
